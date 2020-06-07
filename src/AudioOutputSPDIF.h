@@ -36,8 +36,12 @@
 #include "AudioOutput.h"
 
 #if defined(ESP32)
+#if CONFIG_IDF_TARGET_ESP32S2
+#define SPDIF_OUT_PIN_DEFAULT  39
+#else
 #define SPDIF_OUT_PIN_DEFAULT  27
-#define DMA_BUF_COUNT_DEFAULT  8
+#endif
+#define DMA_BUF_COUNT_DEFAULT  16
 #define DMA_BUF_SIZE_DEFAULT   256
 #elif defined(ESP8266)
 #define SPDIF_OUT_PIN_DEFAULT  3
@@ -56,6 +60,7 @@ class AudioOutputSPDIF : public AudioOutput
     virtual bool SetChannels(int channels) override;
     virtual bool begin() override;
     virtual bool ConsumeSample(int16_t sample[2]) override;
+    virtual void flush() override;
     virtual bool stop() override;
 
     bool SetOutputModeMono(bool mono);  // Force mono output no matter the input
@@ -65,12 +70,12 @@ class AudioOutputSPDIF : public AudioOutput
     const uint32_t VUCP_PREAMBLE_W = 0xCCE40000; // 11001100 11100100
 
   protected:
-    virtual inline int AdjustI2SRate(int hz) { return rate_multiplier * hz; }
+    virtual inline int AdjustI2SRate(int hz) { return 4 * hz; }
     uint8_t portNo;
     bool mono;
     bool i2sOn;
+    int dma_buf_count;
     uint8_t frame_num;
-    uint8_t rate_multiplier;
 };
 
 #endif // _AUDIOOUTPUTSPDIF_H

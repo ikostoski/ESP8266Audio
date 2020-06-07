@@ -86,33 +86,35 @@ static const uint16_t spdif_bmclookup[256] PROGMEM = {
 AudioOutputSPDIF::AudioOutputSPDIF(int dout_pin, int port, int dma_buf_count)
 {
   this->portNo = port;
+  this->dma_buf_count = dma_buf_count;
 #if defined(ESP32)
   // Configure ESP32 I2S to roughly compatible to ESP8266 peripheral
   i2s_config_t i2s_config_spdif = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
-    .sample_rate = 88200, // 2 x sampling_rate 
-    .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT, // 32bit words
+    .sample_rate = 176400L, // 4 x minimum sampling_rate 
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT, 
     .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT, // Right than left
-    .communication_format = (i2s_comm_format_t)(I2S_COMM_FORMAT_I2S | I2S_COMM_FORMAT_I2S_MSB),
+    .communication_format = (i2s_comm_format_t)(I2S_COMM_FORMAT_PCM | I2S_COMM_FORMAT_I2S_MSB),
     .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1, // lowest interrupt priority
     .dma_buf_count = dma_buf_count,
     .dma_buf_len = DMA_BUF_SIZE_DEFAULT, // bigger buffers, reduces interrupts
     .use_apll = true // Audio PLL is needed for low clock jitter
+    #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(3, 3, 0)
+      ,.tx_desc_auto_clear = true // Auto clear TX fifo on underflow
+    #endif
   };
   if (i2s_driver_install((i2s_port_t)portNo, &i2s_config_spdif, 0, NULL) != ESP_OK) {
-    audioLogger->println(F("ERROR: Unable to install I2S drivers"));
+    audioLogger->printf("ERROR: Unable to install I2S drivers\n");
     return;
   }
   i2s_zero_dma_buffer((i2s_port_t)portNo);
   SetPinout(I2S_PIN_NO_CHANGE, I2S_PIN_NO_CHANGE, dout_pin);
-  rate_multiplier = 2; // 2x32bit words
 #elif defined(ESP8266)
   (void) dout_pin;
   if (!I2SDriver.begin(dma_buf_count, DMA_BUF_SIZE_DEFAULT)) {
     audioLogger->println(F("ERROR: Unable to start I2S driver"));
     return;
   }
-  rate_multiplier = 4; // 4x16 bit words
 #endif
   i2sOn = true;
   mono = false;
@@ -168,11 +170,14 @@ bool AudioOutputSPDIF::SetRate(int hz)
   this->hertz = hz;
   int adjustedHz = AdjustI2SRate(hz);
 #if defined(ESP32)
-  if (i2s_set_sample_rates((i2s_port_t)portNo, adjustedHz) == ESP_OK) {
-    if (adjustedHz == 88200) {
-      // Manually fix the APLL rate for 44100. 
+  // FIMXE: First setting of clock with 32bit samples seems to reset something
+  i2s_set_clk((i2s_port_t)portNo, 32000, I2S_BITS_PER_SAMPLE_32BIT, I2S_CHANNEL_STEREO);
+  // And now the actual setting of the clock for 16bit samples
+  if (i2s_set_clk((i2s_port_t)portNo, adjustedHz, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_STEREO) == ESP_OK) {
+    if (adjustedHz == 176400L) { 
+      // Manually fix the APLL rate for 4 x 44100. 
       // See: https://github.com/espressif/esp-idf/issues/2634
-      // sdm0 = 28, sdm1 = 8, sdm2 = 5, odir = 0 -> 88199.977
+      // sdm0 = 28, sdm1 = 8, sdm2 = 5, odir = 0 -> 176.399,954‬
       rtc_clk_apll_enable(1, 28, 8, 5, 0); 
     }
   } else {
@@ -212,6 +217,7 @@ bool AudioOutputSPDIF::begin()
   return true;
 }
 
+#pragma GCC optimize("O0")
 bool AudioOutputSPDIF::ConsumeSample(int16_t sample[2])
 {
   if (!i2sOn) return true; // Sink the data
@@ -242,15 +248,15 @@ bool AudioOutputSPDIF::ConsumeSample(int16_t sample[2])
   lo = pgm_read_word(&spdif_bmclookup[(uint8_t)sample_left]);
   // Low word is inverted depending on first bit of high word
   lo ^= (~((int16_t)hi) >> 16);
-  buf[0] = ((uint32_t)lo << 16) | hi;
+  buf[1] = ((uint32_t)lo << 16) | hi;
   // Fixed 4 bits auxillary-audio-databits, the first used as parity
   // Depending on first bit of low word, invert the bits
   aux = 0xb333 ^ (((uint32_t)((int16_t)lo)) >> 17);
   // Send 'B' preamble only for the first frame of data-block
   if (frame_num == 0) {
-    buf[1] = VUCP_PREAMBLE_B | aux;
+    buf[0] = VUCP_PREAMBLE_B | aux;
   } else {
-    buf[1] = VUCP_PREAMBLE_M | aux;
+    buf[0] = VUCP_PREAMBLE_M | aux;
   }
 
   uint16_t sample_right = Amplify(ms[RIGHTCHANNEL]); 
@@ -258,22 +264,35 @@ bool AudioOutputSPDIF::ConsumeSample(int16_t sample[2])
   hi = pgm_read_word(&spdif_bmclookup[(uint8_t)(sample_right >> 8)]);
   lo = pgm_read_word(&spdif_bmclookup[(uint8_t)sample_right]);
   lo ^= (~((int16_t)hi) >> 16);
-  buf[2] = ((uint32_t)lo << 16) | hi;
+  buf[3] = ((uint32_t)lo << 16) | hi;
   aux = 0xb333 ^ (((uint32_t)((int16_t)lo)) >> 17);
-  buf[3] = VUCP_PREAMBLE_W | aux;
+  buf[2] = VUCP_PREAMBLE_W | aux;
 
-#if defined(ESP32)
-  // Assume DMA buffers are multiples of 16 bytes. Either we write all bytes or none.
-  uint32_t bytes_written;
-  esp_err_t ret = i2s_write((i2s_port_t)portNo, (const char*)&buf, 8 * channels, &bytes_written, 0);
-  // If we didn't write all bytes, return false early and do not increment frame_num
-  if ((ret != ESP_OK) || (bytes_written != (8 * channels))) return false;  
-#elif defined(ESP8266)
-  if (!I2SDriver.writeInterleaved(buf)) return false;
-#endif
+  #if defined(ESP32)
+    // Assume DMA buffers are multiples of 16 bytes. Either we write all bytes or none.
+    uint32_t bytesWritten;
+    esp_err_t ret = i2s_write((i2s_port_t)portNo, (const char*)&buf, sizeof(buf), &bytesWritten, 0);
+    // If we didn't write all bytes, return false early and do not increment frame_num
+    if ((ret != ESP_OK) || (bytesWritten < sizeof(buf))) return false;  
+  #elif defined(ESP8266)    
+    if (!I2SDriver.writeBuffer(buf, 4)) return false;
+  #endif
   // Increment and rotate frame number
   if (++frame_num > 191) frame_num = 0;
   return true;
+}
+
+void AudioOutputSPDIF::flush() {
+#ifdef ESP32
+  // makes sure that all stored DMA samples are consumed / played
+  int buffersize = 64 * this->dma_buf_count;
+  int16_t samples[2] = {0x0,0x0};
+  for (int i=0;i<buffersize; i++) {
+    while (!ConsumeSample(samples)) {
+      delay(10);
+    }
+  }
+#endif
 }
 
 bool AudioOutputSPDIF::stop()

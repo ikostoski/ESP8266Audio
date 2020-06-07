@@ -51,6 +51,7 @@ class SinglePinI2SDriver
     void setRate(const uint32_t rateHz);
     float getActualRate();
     bool write(uint32_t sample);
+    bool writeBuffer(uint32_t *samples, size_t len);
     bool writeInterleaved(uint32_t samples[4]);
     int getUnderflowCount();
 

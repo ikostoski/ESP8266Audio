@@ -94,8 +94,10 @@ bool AudioOutputI2SNoDAC::ConsumeSample(int16_t sample[2])
   DeltaSigma(ms, dsBuff);
 
   // Either send complete pulse stream or nothing
-#ifdef ESP32
-  if (!i2s_write_bytes((i2s_port_t)portNo, (const char *)dsBuff, sizeof(uint32_t) * (oversample/32), 0))
+#ifdef ESP32  
+  size_t bytesWritten;
+  esp_err_t res = i2s_write((i2s_port_t)portNo, (const char *)dsBuff, sizeof(uint32_t) * (oversample/32), &bytesWritten, 0);
+  if ((res != ESP_OK) || (bytesWritten < (sizeof(uint32_t) * (oversample/32))))
     return false;
 #else 
   if (!i2s_write_sample_nb(dsBuff[0])) return false; // No room at the inn

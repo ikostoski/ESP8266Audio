@@ -147,6 +147,16 @@ bool SinglePinI2SDriver::write(uint32_t sample)
   return true;
 };
 
+bool SinglePinI2SDriver::writeBuffer(uint32_t *samples, size_t len) 
+{
+  auto lastSent = lastSentDescriptor();
+  if (isSLCRunning() && (lastSent->next_link_ptr == head)) return false;
+  uint32_t* buf = head->buf_ptr;
+  for (size_t i=0; i<len; i++) buf[headPos++] = samples[i];
+  advanceHead(lastSent);
+  return true;
+};
+
 bool SinglePinI2SDriver::writeInterleaved(uint32_t samples[4]) 
 {
   auto lastSent = lastSentDescriptor();
